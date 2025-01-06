@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased 3.0](https://github.com/opensearch-project/k-NN/compare/2.x...HEAD)
 ### Features
 ### Enhancements
-### Bug Fixes 
+### Bug Fixes
 ### Infrastructure
 ### Documentation
 ### Maintenance
@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Features
 ### Enhancements
 ### Bug Fixes
+* Fix for NPE while merging segments after all the vector fields docs are deleted (#2365)[https://github.com/opensearch-project/k-NN/pull/2365]
 ### Infrastructure
 ### Documentation
 ### Maintenance
