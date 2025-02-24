@@ -1,0 +1,96 @@
+name: Release Atlassian patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      osVersion:
+        description: 'Opensearch version'
+        required: true
+        type: string
+      patchNumber:
+        description: 'Atlassian patch number (e.g. 1, 2 ...)'
+        required: true
+        type: string
+jobs:
+  get-ci-image-tag:
+    uses: opensearch-project/opensearch-build/.github/workflows/get-ci-image-tag.yml@main
+    with:
+      product: opensearch
+
+  build:
+    needs: get-ci-image-tag
+    strategy:
+      matrix:
+        runs-on: [ ubuntu-latest, ubuntu-22.04-arm ]
+    env:
+      CC: gcc10-gcc
+      CXX: gcc10-g++
+      FC: gcc10-gfortran
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      # using the same image which is used by opensearch-build team to build the OpenSearch Distribution
+      # this image tag is subject to change as more dependencies and updates will arrive over time
+      image: ${{ needs.get-ci-image-tag.outputs.ci-image-version-linux }}
+      # need to switch to root so that github actions can install runner binary on container without permission issues.
+      options: ${{ needs.get-ci-image-tag.outputs.ci-image-start-options }}
+
+    permissions:
+      contents: write
+    steps:
+      - name: Run start commands
+        run: ${{ needs.get-ci-image-tag.outputs.ci-image-start-command }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}
+      # Setup git user so that patches for native libraries can be applied and committed
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: 'temurin'
+      - name: Export build architecture
+        run: |
+          if [ ${{ matrix.runs-on }} == 'ubuntu-22.04-arm' ]
+          then 
+            echo "BUILD_ARCH=arm64" >> "$GITHUB_ENV"
+            echo "ARCHITECTURE=arm64" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_ARCH=amd64" >> "$GITHUB_ENV"
+            echo "ARCHITECTURE=x64" >> "$GITHUB_ENV"
+          fi
+      - name: Run build
+        run: |
+          git config --global --add safe.directory `pwd`
+          git config --global --add safe.directory `pwd`/jni/external/nmslib
+          git config --global --add safe.directory `pwd`/jni/external/faiss
+          chmod +x ./scripts/build.sh
+          ./scripts/build.sh -v ${{ inputs.osVersion }} -a ${{ env.ARCHITECTURE }} -s 'false'
+      - name: Rename build assets
+        run: mv ./build/distributions/opensearch-knn-*.zip ./opensearch-knn-${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}.${{ env.BUILD_ARCH }}.zip
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-zip-${{ env.BUILD_ARCH }}
+          path: opensearch-knn-${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}.${{ env.BUILD_ARCH }}.zip
+          retention-days: 1
+          overwrite: true
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls artifacts
+      - name: Release
+        uses: ncipollo/release-action@v1.16.0
+        with:
+          tag: ${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}
+          bodyFile: release-notes/opensearch-knn.release-notes-${{ inputs.osVersion }}.0-atlassian-${{ inputs.patchNumber }}.md
+          artifacts: artifacts/opensearch-knn-*.*.zip
