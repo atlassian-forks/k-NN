@@ -8,18 +8,23 @@ package org.opensearch.knn.index.engine.faiss;
 import com.google.common.collect.ImmutableMap;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.engine.KNNLibraryIndexingContext;
 import org.opensearch.knn.index.engine.KNNMethod;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MethodResolver;
 import org.opensearch.knn.index.engine.NativeLibrary;
 import org.opensearch.knn.index.engine.ResolvedMethodContext;
+import org.opensearch.knn.memoryoptsearch.VectorSearcherFactory;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissMemoryOptimizedSearcherFactory;
+import org.opensearch.remoteindexbuild.model.RemoteIndexParameters;
 
 import java.util.Map;
 import java.util.function.Function;
 
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 import static org.opensearch.knn.common.KNNConstants.METHOD_IVF;
+import static org.opensearch.knn.common.KNNConstants.NAME;
 
 /**
  * Implements NativeLibrary for the faiss native library
@@ -119,8 +124,31 @@ public class Faiss extends NativeLibrary {
         return methodResolver.resolveMethod(knnMethodContext, knnMethodConfigContext, shouldRequireTraining, spaceType);
     }
 
+    /**
+     * Use the method name to route the check to the specific method class
+     */
     @Override
-    public boolean supportsRemoteIndexBuild() {
-        return true;
+    public boolean supportsRemoteIndexBuild(KNNLibraryIndexingContext knnLibraryIndexingContext) {
+        if (knnLibraryIndexingContext != null) {
+            Map<String, Object> parameters = knnLibraryIndexingContext.getLibraryParameters();
+            if (METHOD_HNSW.equals(parameters.get(NAME))) {
+                return FaissHNSWMethod.supportsRemoteIndexBuild(parameters);
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public RemoteIndexParameters createRemoteIndexingParameters(Map<String, Object> parameters) {
+        if (METHOD_HNSW.equals(parameters.get(NAME))) {
+            FaissHNSWMethod method = (FaissHNSWMethod) METHODS.get(METHOD_HNSW);
+            return method.createRemoteIndexingParameters(parameters);
+        }
+        throw new IllegalArgumentException("Unsupported method for remote indexing");
+    }
+
+    @Override
+    public VectorSearcherFactory getVectorSearcherFactory() {
+        return new FaissMemoryOptimizedSearcherFactory();
     }
 }

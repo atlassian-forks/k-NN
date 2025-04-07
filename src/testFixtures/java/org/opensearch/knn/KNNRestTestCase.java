@@ -16,6 +16,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.commons.lang.StringUtils;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.net.URIBuilder;
+import org.hamcrest.Matchers;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.opensearch.Version;
@@ -24,6 +25,7 @@ import org.opensearch.client.Response;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
@@ -42,7 +44,7 @@ import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
-import org.opensearch.knn.index.codec.derivedsource.ParentChildHelper;
+import org.opensearch.knn.index.codec.backward_codecs.KNN9120Codec.ParentChildHelper;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.knn.indices.ModelState;
 import org.opensearch.knn.plugin.KNNPlugin;
@@ -109,6 +111,7 @@ import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 import static org.opensearch.knn.index.KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD;
 import static org.opensearch.knn.index.KNNSettings.KNN_INDEX;
 import static org.opensearch.knn.index.KNNSettings.KNN_INDEX_REMOTE_VECTOR_BUILD;
+import static org.opensearch.knn.index.KNNSettings.KNN_INDEX_REMOTE_VECTOR_BUILD_THRESHOLD;
 import static org.opensearch.knn.index.SpaceType.L2;
 import static org.opensearch.knn.index.engine.KNNEngine.FAISS;
 import static org.opensearch.knn.index.memory.NativeMemoryCacheManager.GRAPH_COUNT;
@@ -771,7 +774,7 @@ public class KNNRestTestCase extends ODFERestTestCase {
      * Adds a doc where document is represented as a string.
      */
     protected void addKnnDoc(final String index, final String docId, final String document) throws IOException {
-        Request request = new Request("POST", "/" + index + "/_doc/" + docId);
+        Request request = new Request("POST", "/" + index + "/_doc/" + docId); // + "?refresh=true");
         request.setJsonEntity(document);
         client().performRequest(request);
     }
@@ -829,40 +832,16 @@ public class KNNRestTestCase extends ODFERestTestCase {
     /**
      * Update a KNN Doc using the POST /\<index_name\>/_update/\<doc_id\>. Only the vector field will be updated.
      */
-    protected <T> void updateKnnDocWithUpdateAPI(String index, String docId, String fieldName, T vector) throws IOException {
+    protected void updateUpdateAPI(String index, String docId, String body) throws IOException {
         Request request = new Request("POST", "/" + index + "/_update/" + docId + "?refresh=true");
-        XContentBuilder builder = XContentFactory.jsonBuilder().startObject().startObject("doc");
-        String parent = ParentChildHelper.getParentField(fieldName);
-        if (parent != null) {
-            builder.startObject(parent).field(fieldName, vector).endObject();
-        } else {
-            builder.field(fieldName, vector);
-        }
-        builder.endObject().endObject();
-        request.setJsonEntity(builder.toString());
+        request.setJsonEntity(body);
         Response response = client().performRequest(request);
         assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
     }
 
-    protected <T> void updateKnnDocByQuery(String index, String docId, String fieldName, T vector) throws IOException {
+    protected void updateKnnDocByQuery(String index, String query) throws IOException {
         Request request = new Request("POST", "/" + index + "/_update_by_query?refresh=true");
-        XContentBuilder builder = XContentFactory.jsonBuilder()
-            .startObject()
-            .startObject("query")
-            .startObject("term")
-            .field("id", docId)
-            .endObject()
-            .endObject()
-            .startObject("script")
-            .field("source", "ctx._source." + fieldName + " = params.newValue")
-            .field("lang", "painless")
-            .startObject("params")
-            .field("newValue", vector)
-            .endObject()
-            .endObject()
-            .endObject();
-        request.setJsonEntity(builder.toString());
-
+        request.setJsonEntity(query);
         Response response = client().performRequest(request);
         assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
     }
@@ -990,8 +969,10 @@ public class KNNRestTestCase extends ODFERestTestCase {
             .put(KNN_INDEX, true)
             .put(INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, approximateThreshold);
 
-        if (isRemoteIndexBuildSupported(getBWCVersion())) {
-            builder.put(KNN_INDEX_REMOTE_VECTOR_BUILD, randomBoolean());
+        // Randomly enable remote index build feature to test fallbacks
+        if (isRemoteIndexBuildSupported(getBWCVersion()) && randomBoolean()) {
+            builder.put(KNN_INDEX_REMOTE_VECTOR_BUILD, true);
+            builder.put(KNN_INDEX_REMOTE_VECTOR_BUILD_THRESHOLD, "0mb");
         }
         return builder.build();
     }
@@ -1566,7 +1547,7 @@ public class KNNRestTestCase extends ODFERestTestCase {
     ) throws IOException {
         bulkIngestRandomVectorsWithSkipsAndNestedMultiDoc(
             indexName,
-            nestedFieldName,
+            Collections.singletonList(nestedFieldName),
             nestedNumericPath,
             numVectors,
             dimension,
@@ -1577,7 +1558,7 @@ public class KNNRestTestCase extends ODFERestTestCase {
 
     public void bulkIngestRandomVectorsWithSkipsAndNestedMultiDoc(
         String indexName,
-        String nestedFieldName,
+        List<String> nestedFieldNames,
         String nestedNumericPath,
         int numDocs,
         int dimension,
@@ -1588,20 +1569,21 @@ public class KNNRestTestCase extends ODFERestTestCase {
         random.setSeed(2);
         float[][] vectors = TestUtils.randomlyGenerateStandardVectors(numDocs * maxDoc, dimension, 1);
         for (int i = 0; i < numDocs; i++) {
-            int nestedDocs = random.nextInt(maxDoc) + 1;
-            XContentBuilder builder = XContentFactory.jsonBuilder()
-                .startObject()
-                .startArray(ParentChildHelper.getParentField(nestedFieldName));
-            for (int j = 0; j < nestedDocs; j++) {
-                builder.startObject();
-                if (random.nextFloat() > skipProb) {
-                    builder.field(ParentChildHelper.getChildField(nestedFieldName), vectors[i + j]);
-                } else {
-                    builder.field(ParentChildHelper.getChildField(nestedNumericPath), 1);
+            XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
+            for (String nestedFieldName : nestedFieldNames) {
+                builder.startArray(ParentChildHelper.getParentField(nestedFieldName));
+                int nestedDocs = random.nextInt(maxDoc) + 1;
+                for (int j = 0; j < nestedDocs; j++) {
+                    builder.startObject();
+                    if (random.nextFloat() > skipProb) {
+                        builder.field(ParentChildHelper.getChildField(nestedFieldName), vectors[i + j]);
+                    } else {
+                        builder.field(nestedNumericPath, 1);
+                    }
+                    builder.endObject();
                 }
-                builder.endObject();
+                builder.endArray();
             }
-            builder.endArray();
             builder.endObject();
             addKnnDoc(indexName, String.valueOf(i + 1), builder.toString());
         }
@@ -1808,13 +1790,7 @@ public class KNNRestTestCase extends ODFERestTestCase {
         Integer m,
         Integer ef_construction
     ) {
-        return Settings.builder()
-            .put(NUMBER_OF_SHARDS, 1)
-            .put(NUMBER_OF_REPLICAS, 0)
-            .put(INDEX_KNN, true)
-            .put(KNNSettings.KNN_SPACE_TYPE, spaceType.getValue())
-            .put(KNNSettings.KNN_ALGO_PARAM_M, m)
-            .put(KNNSettings.KNN_ALGO_PARAM_EF_CONSTRUCTION, ef_construction);
+        return Settings.builder().put(NUMBER_OF_SHARDS, 1).put(NUMBER_OF_REPLICAS, 0).put(INDEX_KNN, true);
     }
 
     protected Settings createKNNIndexCustomLegacyFieldMappingIndexSettings(SpaceType spaceType, Integer m, Integer ef_construction) {
@@ -2282,11 +2258,11 @@ public class KNNRestTestCase extends ODFERestTestCase {
         assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
     }
 
-    protected void addKnnDocWithAttributes(
+    protected <T> void addKnnDocWithAttributes(
         String indexName,
         String docId,
         String vectorFieldName,
-        float[] vector,
+        T vector,
         Map<String, String> fieldValues
     ) throws IOException {
         Request request = new Request("POST", "/" + indexName + "/_doc/" + docId + "?refresh=true");
@@ -2370,4 +2346,46 @@ public class KNNRestTestCase extends ODFERestTestCase {
     protected static String randomLowerCaseString() {
         return randomAlphaOfLengthBetween(MIN_CODE_UNITS, MAX_CODE_UNITS).toLowerCase(Locale.ROOT);
     }
+
+    @SneakyThrows
+    protected void setupSnapshotRestore(String index, String snapshot, String repository) {
+        final String pathRepo = System.getProperty("tests.path.repo");
+
+        // create index
+        createIndex(index, getDefaultIndexSettings());
+
+        // create repo
+        Settings repoSettings = Settings.builder().put("compress", randomBoolean()).put("location", pathRepo).build();
+        registerRepository(repository, "fs", true, repoSettings);
+
+        // create snapshot
+        createSnapshot(repository, snapshot, true);
+    }
+
+    protected static void restoreSnapshot(
+        String restoreIndexSuffix,
+        List<String> indices,
+        String repository,
+        String snapshot,
+        boolean waitForCompletion
+    ) throws IOException {
+        // valid restore
+        XContentBuilder restoreCommand = JsonXContent.contentBuilder().startObject();
+        restoreCommand.field("indices", String.join(",", indices));
+        restoreCommand.field("rename_pattern", "(.+)");
+        restoreCommand.field("rename_replacement", "$1" + restoreIndexSuffix);
+        restoreCommand.endObject();
+
+        Request restoreRequest = new Request("POST", "/_snapshot/" + repository + "/" + snapshot + "/_restore");
+        restoreRequest.addParameter("wait_for_completion", "true");
+        restoreRequest.setJsonEntity(restoreCommand.toString());
+
+        final Response restoreResponse = client().performRequest(restoreRequest);
+        assertThat(
+            "Failed to restore snapshot [" + snapshot + "] from repository [" + repository + "]: " + String.valueOf(restoreResponse),
+            restoreResponse.getStatusLine().getStatusCode(),
+            Matchers.equalTo(RestStatus.OK.getStatus())
+        );
+    }
+
 }

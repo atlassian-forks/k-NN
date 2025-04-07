@@ -27,6 +27,7 @@ import java.util.Map;
  * Service to distribute requests to the proper engine jni service
  */
 public class JNIService {
+
     /**
      * Initialize an index for the native library. Takes in numDocs to
      * allocate the correct amount of memory.
@@ -47,7 +48,6 @@ public class JNIService {
             }
 
             return FaissService.initIndex(numDocs, dim, parameters);
-
         }
 
         throw new IllegalArgumentException(
@@ -417,21 +417,6 @@ public class JNIService {
         throw new IllegalArgumentException(
             String.format(Locale.ROOT, "TrainIndex not supported for provided engine : %s", knnEngine.getName())
         );
-    }
-
-    /**
-     * <p>
-     * The function is deprecated. Use {@link JNICommons#storeVectorData(long, float[][], long, boolean)}
-     * </p>
-     * Transfer vectors from Java to native
-     *
-     * @param vectorsPointer pointer to vectors in native memory. Should be 0 to create vector as well
-     * @param trainingData   data to be transferred
-     * @return pointer to native memory location of training data
-     */
-    @Deprecated(since = "2.14.0", forRemoval = true)
-    public static long transferVectors(long vectorsPointer, float[][] trainingData) {
-        return FaissService.transferVectors(vectorsPointer, trainingData);
     }
 
     /**

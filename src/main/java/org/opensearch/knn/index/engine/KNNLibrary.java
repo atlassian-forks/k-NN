@@ -5,11 +5,15 @@
 
 package org.opensearch.knn.index.engine;
 
+import org.opensearch.Version;
 import org.opensearch.common.ValidationException;
 import org.opensearch.knn.index.SpaceType;
+import org.opensearch.remoteindexbuild.model.RemoteIndexParameters;
+import org.opensearch.knn.memoryoptsearch.VectorSearcherFactory;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * KNNLibrary is an interface that helps the plugin communicate with k-NN libraries
@@ -141,10 +145,37 @@ public interface KNNLibrary extends MethodResolver {
     }
 
     /**
-     * Returns whether or not the engine implementation supports remote index build
+     * Returns whether the engine implementation supports remote index build
      * @return true if remote index build is supported, false otherwise
      */
-    default boolean supportsRemoteIndexBuild() {
+    default boolean supportsRemoteIndexBuild(KNNLibraryIndexingContext knnLibraryIndexingContext) {
         return false;
+    }
+
+    /**
+     * Checks if the library is deprecated for a given OpenSearch version.
+     *
+     * @param indexVersionCreated the OpenSearch version where the index is created
+     * @return true if deprecated, false otherwise
+     */
+    default boolean isRestricted(Version indexVersionCreated) {
+        return false; // By default, libraries are not deprecated
+    }
+
+    /**
+     * Creates the set of index parameters needed to build the remote index
+     */
+    default RemoteIndexParameters createRemoteIndexingParameters(Map<String, Object> parameters) {
+        throw new UnsupportedOperationException("Remote build service does not support this engine");
+    }
+
+    /**
+     * Create a new vector searcher factory that compatible with on Lucene search API.
+     * @return New searcher factory that returns {@link org.opensearch.knn.memoryoptsearch.VectorSearcher}
+     *         If it is not supported, it should return null.
+     *         But, if it is supported, the factory shall not return null searcher.
+     */
+    default VectorSearcherFactory getVectorSearcherFactory() {
+        return null;
     }
 }

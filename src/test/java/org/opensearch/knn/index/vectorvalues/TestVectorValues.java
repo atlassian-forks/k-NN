@@ -8,13 +8,14 @@ import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.knn.index.codec.util.KNNVectorAsCollectionOfFloatsSerializer;
 import org.opensearch.knn.index.codec.util.KNNVectorSerializer;
-import org.opensearch.knn.index.codec.util.KNNVectorSerializerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 
+import static com.carrotsearch.randomizedtesting.RandomizedTest.randomByte;
 import static com.carrotsearch.randomizedtesting.RandomizedTest.randomFloat;
 
 public class TestVectorValues {
@@ -143,7 +144,7 @@ public class TestVectorValues {
             this.count = count;
             this.dimension = dimension;
             this.current = -1;
-            this.knnVectorSerializer = KNNVectorSerializerFactory.getDefaultSerializer();
+            this.knnVectorSerializer = KNNVectorAsCollectionOfFloatsSerializer.INSTANCE;
         }
 
         @Override
@@ -404,6 +405,14 @@ public class TestVectorValues {
         float[] data = new float[dimension];
         for (int i = 0; i < dimension; i++) {
             data[i] = randomFloat();
+        }
+        return data;
+    }
+
+    public static byte[] getRandomByteVector(int dimension) {
+        byte[] data = new byte[dimension];
+        for (int i = 0; i < dimension; i++) {
+            data[i] = randomByte();
         }
         return data;
     }

@@ -104,6 +104,7 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
 
         final KNNMethodContext knnMethodContext = knnMappingConfig.getKnnMethodContext()
             .orElseThrow(() -> new IllegalArgumentException("KNN method context cannot be empty"));
+        nativeIndexBuildStrategyFactory.setKnnLibraryIndexingContext(knnMappingConfig.getKnnLibraryIndexingContext());
         final KNNEngine engine = knnMethodContext.getKnnEngine();
         final Map<String, Object> params = knnMethodContext.getMethodComponentContext().getParameters();
 
@@ -155,11 +156,12 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
     private NativeEngines990KnnVectorsFormat nativeEngineVectorsFormat() {
         // mapperService is already checked for null or valid instance type at caller, hence we don't need
         // addition isPresent check here.
-        int approximateThreshold = getApproximateThresholdValue();
+        final int approximateThreshold = getApproximateThresholdValue();
         return new NativeEngines990KnnVectorsFormat(
             new Lucene99FlatVectorsFormat(FlatVectorScorerUtil.getLucene99FlatVectorsScorer()),
             approximateThreshold,
-            nativeIndexBuildStrategyFactory
+            nativeIndexBuildStrategyFactory,
+            mapperService
         );
     }
 

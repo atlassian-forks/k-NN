@@ -10,6 +10,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.cluster.NamedDiff;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
@@ -20,6 +21,7 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -29,9 +31,11 @@ import org.opensearch.index.codec.CodecServiceFactory;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.SystemIndexDescriptor;
+import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.index.KNNCircuitBreaker;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNNCodecService;
+import org.opensearch.knn.index.codec.derivedsource.DerivedSourceIndexOperationListener;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
@@ -82,14 +86,17 @@ import org.opensearch.knn.quantization.models.quantizationState.QuantizationStat
 import org.opensearch.knn.training.TrainingJobClusterStateListener;
 import org.opensearch.knn.training.TrainingJobRunner;
 import org.opensearch.knn.training.VectorReader;
+import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.MapperPlugin;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.ReloadablePlugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
+import org.opensearch.remoteindexbuild.client.RemoteIndexHTTPClient;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
@@ -116,6 +123,7 @@ import static java.util.Collections.singletonList;
 import static org.opensearch.knn.common.KNNConstants.KNN_THREAD_POOL_PREFIX;
 import static org.opensearch.knn.common.KNNConstants.MODEL_INDEX_NAME;
 import static org.opensearch.knn.common.KNNConstants.TRAIN_THREAD_POOL;
+import static org.opensearch.knn.index.KNNCircuitBreaker.KNN_CIRCUIT_BREAKER_TIER;
 
 /**
  * Entry point for the KNN plugin where we define mapper for knn_vector type
@@ -153,9 +161,11 @@ public class KNNPlugin extends Plugin
         SearchPlugin,
         ActionPlugin,
         EnginePlugin,
+        ClusterPlugin,
         ScriptPlugin,
         ExtensiblePlugin,
-        SystemIndexPlugin {
+        SystemIndexPlugin,
+        ReloadablePlugin {
 
     public static final String LEGACY_KNN_BASE_URI = "/_opendistro/_knn";
     public static final String KNN_BASE_URI = "/_plugins/_knn";
@@ -295,6 +305,9 @@ public class KNNPlugin extends Plugin
     @Override
     public void onIndexModule(IndexModule indexModule) {
         KNNSettings.state().onIndexModule(indexModule);
+        if (KNNSettings.isKNNDerivedSourceEnabled(indexModule.getSettings())) {
+            indexModule.addIndexOperationListener(new DerivedSourceIndexOperationListener());
+        }
     }
 
     /**
@@ -361,5 +374,33 @@ public class KNNPlugin extends Plugin
     @Override
     public Optional<ConcurrentSearchRequestDecider.Factory> getConcurrentSearchRequestDeciderFactory() {
         return Optional.of(new KNNConcurrentSearchRequestDecider.Factory());
+    }
+
+    @Override
+    public void onNodeStarted(DiscoveryNode localNode) {
+        // Attempt to fetch a cb tier from node attributes and cache the result.
+        // Get this node's circuit breaker tier attribute
+        Optional<String> tierAttribute = Optional.ofNullable(localNode.getAttributes().get(KNN_CIRCUIT_BREAKER_TIER));
+        if (tierAttribute.isPresent()) {
+            KNNSettings.state().setNodeCbAttribute(tierAttribute);
+
+            // Only rebuild the cache if the weight has actually changed
+            if (KNNSettings.state().getCircuitBreakerLimit().getKb() != NativeMemoryCacheManager.getInstance()
+                .getMaxCacheSizeInKilobytes()) {
+                NativeMemoryCacheManager.getInstance().rebuildCache();
+            }
+        }
+    }
+
+    /**
+     * Update the secure settings by passing the updated settings down upon reload
+     */
+    @Override
+    public void reload(Settings settings) {
+        if (KNNFeatureFlags.isKNNRemoteVectorBuildEnabled()) {
+            SecureString username = KNNSettings.KNN_REMOTE_BUILD_CLIENT_USERNAME_SETTING.get(settings);
+            SecureString password = KNNSettings.KNN_REMOTE_BUILD_CLIENT_PASSWORD_SETTING.get(settings);
+            RemoteIndexHTTPClient.reloadAuthHeader(username, password);
+        }
     }
 }

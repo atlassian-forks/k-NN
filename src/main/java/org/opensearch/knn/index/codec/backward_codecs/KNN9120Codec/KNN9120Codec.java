@@ -16,9 +16,7 @@ import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.codec.KNN80Codec.KNN80CompoundFormat;
 import org.opensearch.knn.index.codec.KNN80Codec.KNN80DocValuesFormat;
-import org.opensearch.knn.index.codec.KNN9120Codec.DerivedSourceStoredFieldsFormat;
 import org.opensearch.knn.index.codec.KNN9120Codec.KNN9120PerFieldKnnVectorsFormat;
-import org.opensearch.knn.index.codec.derivedsource.DerivedSourceReadersSupplier;
 
 import java.util.Optional;
 
@@ -77,7 +75,7 @@ public class KNN9120Codec extends FilterCodec {
     }
 
     private StoredFieldsFormat getStoredFieldsFormat() {
-        DerivedSourceReadersSupplier derivedSourceReadersSupplier = new DerivedSourceReadersSupplier((segmentReadState) -> {
+        KNN9120DerivedSourceReadersSupplier derivedSourceReadersSupplier = new KNN9120DerivedSourceReadersSupplier((segmentReadState) -> {
             if (segmentReadState.fieldInfos.hasVectorValues()) {
                 return knnVectorsFormat().fieldsReader(segmentReadState);
             }
@@ -100,6 +98,6 @@ public class KNN9120Codec extends FilterCodec {
             }
             return null;
         }));
-        return new DerivedSourceStoredFieldsFormat(delegate.storedFieldsFormat(), derivedSourceReadersSupplier, mapperService);
+        return new KNN9120DerivedSourceStoredFieldsFormat(delegate.storedFieldsFormat(), derivedSourceReadersSupplier, mapperService);
     }
 }

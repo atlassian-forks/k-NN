@@ -21,8 +21,6 @@ import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.KnnByteVectorField;
-import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.index.IndexOptions;
 import org.opensearch.Version;
 import org.opensearch.common.Explicit;
@@ -39,6 +37,8 @@ import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.ParametrizedFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.DerivedKnnByteVectorField;
+import org.opensearch.knn.index.DerivedKnnFloatVectorField;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.EngineResolver;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
@@ -49,8 +49,8 @@ import org.opensearch.knn.index.VectorField;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.index.engine.SpaceTypeResolver;
+import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.indices.ModelDao;
-
 import static org.opensearch.knn.common.KNNConstants.DEFAULT_VECTOR_DATA_TYPE_FIELD;
 import static org.opensearch.knn.common.KNNConstants.KNN_METHOD;
 import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
@@ -60,7 +60,6 @@ import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createSto
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createStoredFieldForFloatVector;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.useFullFieldNameValidation;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.validateIfCircuitBreakerIsNotTriggered;
-import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.validateIfKNNPluginEnabled;
 import static org.opensearch.knn.index.mapper.ModelFieldMapper.UNSET_MODEL_DIMENSION_IDENTIFIER;
 
 /**
@@ -94,7 +93,6 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
      */
     public static class Builder extends ParametrizedFieldMapper.Builder {
         protected Boolean ignoreMalformed;
-        protected final boolean isDerivedSourceEnabled;
 
         protected final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
         protected final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
@@ -158,11 +156,20 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             () -> null,
             (n, c, o) -> KNNMethodContext.parse(o),
             m -> toType(m).originalMappingParameters.getKnnMethodContext()
-        ).setSerializer(((b, n, v) -> {
-            b.startObject(n);
-            v.toXContent(b, ToXContent.EMPTY_PARAMS);
-            b.endObject();
-        }), m -> m.getMethodComponentContext().getName());
+        ).setSerializer(
+            // Main serializer - handles null values with nullField
+            (b, f, v) -> {
+                if (v == null) {
+                    b.nullField(f);
+                } else {
+                    b.startObject(f);
+                    v.toXContent(b, ToXContent.EMPTY_PARAMS);
+                    b.endObject();
+                }
+            },
+            // Conflict serializer - simple string representation for error messages
+            v -> v == null ? null : v.getMethodComponentContext().getName()
+        );
 
         protected final Parameter<String> mode = Parameter.restrictedStringParam(
             KNNConstants.MODE_PARAMETER,
@@ -202,15 +209,13 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             ModelDao modelDao,
             Version indexCreatedVersion,
             KNNMethodConfigContext knnMethodConfigContext,
-            OriginalMappingParameters originalParameters,
-            boolean isDerivedSourceEnabled
+            OriginalMappingParameters originalParameters
         ) {
             super(name);
             this.modelDao = modelDao;
             this.indexCreatedVersion = indexCreatedVersion;
             this.knnMethodConfigContext = knnMethodConfigContext;
             this.originalParameters = originalParameters;
-            this.isDerivedSourceEnabled = isDerivedSourceEnabled;
         }
 
         @Override
@@ -264,8 +269,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     modelDao,
                     indexCreatedVersion,
                     originalParameters,
-                    knnMethodConfigContext,
-                    isDerivedSourceEnabled
+                    knnMethodConfigContext
                 );
             }
 
@@ -287,8 +291,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     ignoreMalformed,
                     stored.get(),
                     hasDocValues.get(),
-                    originalParameters,
-                    isDerivedSourceEnabled
+                    originalParameters
                 );
             }
 
@@ -309,8 +312,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     metaValue,
                     knnMethodConfigContext,
                     createLuceneFieldMapperInput,
-                    originalParameters,
-                    isDerivedSourceEnabled
+                    originalParameters
                 );
             }
 
@@ -324,8 +326,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 ignoreMalformed,
                 stored.getValue(),
                 hasDocValues.getValue(),
-                originalParameters,
-                isDerivedSourceEnabled
+                originalParameters
             );
         }
 
@@ -373,8 +374,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 modelDaoSupplier.get(),
                 parserContext.indexVersionCreated(),
                 null,
-                null,
-                KNNSettings.isKNNDerivedSourceEnabled(parserContext.getSettings())
+                null
             );
             builder.parse(name, parserContext, node);
             builder.setOriginalParameters(new OriginalMappingParameters(builder));
@@ -425,6 +425,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 // Resolve method component. For the legacy case where space type can be configured at index level,
                 // it first tries to use the given one then tries to get it from index setting when the space type is UNDEFINED.
                 resolveKNNMethodComponents(builder, parserContext, resolvedSpaceType);
+                // Validate if the KNN engine is allowed for index creation
+                validateBlockedKNNEngine(builder.knnMethodContext.get(), parserContext.indexVersionCreated());
                 validateFromKNNMethod(builder);
             }
 
@@ -453,6 +455,29 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             if (isModeOrCompressionConfigured && builder.vectorDataType.getValue() != VectorDataType.FLOAT) {
                 throw new MapperParsingException(
                     String.format(Locale.ROOT, "Compression and mode cannot be used for non-float32 data type for field %s", builder.name)
+                );
+            }
+        }
+
+        /**
+         * Validates whether the provided KNN engine is allowed for index creation.
+         * If the engine is NMSLIB and the OpenSearch version is 3.0.0 or later,
+         * it throws an IllegalArgumentException to prevent new index creation.
+         *
+         * @param knnMethodContext The KNN method configuration that contains the engine type.
+         * @param indexVersionCreated The OpenSearch version when the index is being created.
+         * @throws IllegalArgumentException if the engine is NMSLIB and version is 3.0.0 or later.
+         */
+        private void validateBlockedKNNEngine(KNNMethodContext knnMethodContext, Version indexVersionCreated) {
+            if (knnMethodContext == null) return;
+            KNNEngine engine = knnMethodContext.getKnnEngine();
+            if (engine.isRestricted(indexVersionCreated)) {
+                throw new IllegalArgumentException(
+                    engine.getName()
+                        + " engine is deprecated in OpenSearch "
+                        + " and cannot be used for new index creation in OpenSearch from  "
+                        + engine.getRestrictedFromVersion()
+                        + "."
                 );
             }
         }
@@ -589,12 +614,12 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
     // values of KNN engine Algorithms hyperparameters.
     protected Version indexCreatedVersion;
     protected Explicit<Boolean> ignoreMalformed;
-    protected final boolean isDerivedSourceEnabled;
     protected boolean stored;
     protected boolean hasDocValues;
     protected VectorDataType vectorDataType;
     protected ModelDao modelDao;
     protected boolean useLuceneBasedVectorField;
+    protected Boolean isDerivedSourceEnabled;
 
     // We need to ensure that the original KNNMethodContext as parsed is stored to initialize the
     // Builder for serialization. So, we need to store it here. This is mainly to ensure that the legacy field mapper
@@ -610,8 +635,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         boolean stored,
         boolean hasDocValues,
         Version indexCreatedVersion,
-        OriginalMappingParameters originalMappingParameters,
-        boolean isDerivedSourceEnabled
+        OriginalMappingParameters originalMappingParameters
     ) {
         super(simpleName, mappedFieldType, multiFields, copyTo);
         this.ignoreMalformed = ignoreMalformed;
@@ -621,7 +645,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         updateEngineStats();
         this.indexCreatedVersion = indexCreatedVersion;
         this.originalMappingParameters = originalMappingParameters;
-        this.isDerivedSourceEnabled = isDerivedSourceEnabled;
+        this.isDerivedSourceEnabled = null;
     }
 
     public KNNVectorFieldMapper clone() {
@@ -638,16 +662,16 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         parseCreateField(context, fieldType().getKnnMappingConfig().getDimension(), fieldType().getVectorDataType());
     }
 
-    private Field createVectorField(float[] vectorValue) {
+    private Field createVectorField(float[] vectorValue, boolean isDerivedEnabled) {
         if (useLuceneBasedVectorField) {
-            return new KnnFloatVectorField(name(), vectorValue, fieldType);
+            return new DerivedKnnFloatVectorField(name(), vectorValue, fieldType, isDerivedEnabled);
         }
         return new VectorField(name(), vectorValue, fieldType);
     }
 
-    private Field createVectorField(byte[] vectorValue) {
+    private Field createVectorField(byte[] vectorValue, boolean isDerivedEnabled) {
         if (useLuceneBasedVectorField) {
-            return new KnnByteVectorField(name(), vectorValue, fieldType);
+            return new DerivedKnnByteVectorField(name(), vectorValue, fieldType, isDerivedEnabled);
         }
         return new VectorField(name(), vectorValue, fieldType);
     }
@@ -658,9 +682,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
      * @param array array of floats
      * @return {@link List} of {@link Field}
      */
-    protected List<Field> getFieldsForFloatVector(final float[] array) {
+    protected List<Field> getFieldsForFloatVector(final float[] array, boolean isDerivedEnabled) {
         final List<Field> fields = new ArrayList<>();
-        fields.add(createVectorField(array));
+        fields.add(createVectorField(array, isDerivedEnabled));
         if (this.stored) {
             fields.add(createStoredFieldForFloatVector(name(), array));
         }
@@ -673,9 +697,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
      * @param array array of bytes
      * @return {@link List} of {@link Field}
      */
-    protected List<Field> getFieldsForByteVector(final byte[] array) {
+    protected List<Field> getFieldsForByteVector(final byte[] array, boolean isDerivedEnabled) {
         final List<Field> fields = new ArrayList<>();
-        fields.add(createVectorField(array));
+        fields.add(createVectorField(array, isDerivedEnabled));
         if (this.stored) {
             fields.add(createStoredFieldForByteVector(name(), array));
         }
@@ -686,7 +710,6 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
      * Validation checks before parsing of doc begins
      */
     protected void validatePreparse() {
-        validateIfKNNPluginEnabled();
         validateIfCircuitBreakerIsNotTriggered();
     }
 
@@ -739,7 +762,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final byte[] array = bytesArrayOptional.get();
             getVectorValidator().validateVector(array);
             getVectorTransformer().transform(array);
-            context.doc().addAll(getFieldsForByteVector(array));
+            context.doc().addAll(getFieldsForByteVector(array, isDerivedEnabled(context)));
         } else if (VectorDataType.FLOAT == vectorDataType) {
             Optional<float[]> floatsArrayOptional = getFloatsFromContext(context, dimension);
 
@@ -749,7 +772,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final float[] array = floatsArrayOptional.get();
             getVectorValidator().validateVector(array);
             getVectorTransformer().transform(array);
-            context.doc().addAll(getFieldsForFloatVector(array));
+            context.doc().addAll(getFieldsForFloatVector(array, isDerivedEnabled(context)));
         } else {
             throw new IllegalArgumentException(
                 String.format(Locale.ROOT, "Cannot parse context for unsupported values provided for field [%s]", VECTOR_DATA_TYPE_FIELD)
@@ -757,6 +780,14 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         }
 
         context.path().remove();
+    }
+
+    private boolean isDerivedEnabled(ParseContext parseContext) {
+        if (isDerivedSourceEnabled == null) {
+            isDerivedSourceEnabled = IndexUtil.isDerivedEnabledForIndex(parseContext.mapperService())
+                && IndexUtil.isDerivedEnabledForField(fieldType(), parseContext.mapperService());
+        }
+        return isDerivedSourceEnabled;
     }
 
     // Returns an optional array of byte values where each value in the vector is parsed as a float and validated
@@ -854,8 +885,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             modelDao,
             indexCreatedVersion,
             knnMethodConfigContext,
-            originalMappingParameters,
-            isDerivedSourceEnabled
+            originalMappingParameters
         ).init(this);
     }
 
